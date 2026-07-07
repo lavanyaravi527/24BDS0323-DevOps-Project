@@ -1,0 +1,140 @@
+// =============================================================================
+// TechNova 2026 — Jenkins CI/CD pipeline
+//
+// Stages: checkout -> docker build -> (optional) docker push -> deploy to k8s
+// -> smoke test. Designed for a simple DevOps-assignment Jenkins setup
+// (freestyle "Pipeline script from SCM" job pointed at this repo, or a
+// Multibranch Pipeline) running on an agent that has docker + kubectl
+// available on its PATH.
+//
+// Configure a GitHub webhook (or poll SCM) on this repo so every push
+// triggers a build automatically — that satisfies the "automated
+// deployment on every commit" requirement.
+// =============================================================================
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    // Fill these in under Jenkins > Credentials, or override at run time.
+    parameters {
+        string(name: 'IMAGE_NAME', defaultValue: 'technova2026', description: 'Docker image name')
+        string(name: 'DOCKERHUB_REPO', defaultValue: '', description: 'e.g. yourusername/technova2026 — leave blank to skip push')
+        booleanParam(name: 'DEPLOY_TO_K8S', defaultValue: true, description: 'Run kubectl apply -k k8s/ after build')
+    }
+
+    environment {
+        IMAGE_TAG   = "${env.BUILD_NUMBER}"
+        GIT_SHA     = "${sh(script: 'git rev-parse --short HEAD || echo local', returnStdout: true).trim()}"
+        FULL_IMAGE  = "${params.IMAGE_NAME}:${IMAGE_TAG}"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "Checked out commit ${GIT_SHA}"
+            }
+        }
+
+        stage('Lint / Sanity Check') {
+            steps {
+                // Cheap static checks so a broken commit fails fast, before
+                // spending time on a Docker build.
+                sh '''
+                    echo "Checking required files exist..."
+                    test -f index.html
+                    test -f Dockerfile
+                    test -d k8s
+                    echo "OK"
+                '''
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh """
+                    docker build \
+                      --build-arg APP_VERSION=${IMAGE_TAG} \
+                      --build-arg GIT_SHA=${GIT_SHA} \
+                      -t ${FULL_IMAGE} \
+                      -t ${params.IMAGE_NAME}:latest \
+                      .
+                """
+            }
+        }
+
+        stage('Docker Push') {
+            when {
+                expression { return params.DOCKERHUB_REPO?.trim() }
+            }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        echo "\$DOCKER_PASS" | docker login -u "\$DOCKER_USER" --password-stdin
+                        docker tag ${FULL_IMAGE} ${params.DOCKERHUB_REPO}:${IMAGE_TAG}
+                        docker tag ${FULL_IMAGE} ${params.DOCKERHUB_REPO}:latest
+                        docker push ${params.DOCKERHUB_REPO}:${IMAGE_TAG}
+                        docker push ${params.DOCKERHUB_REPO}:latest
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            when {
+                expression { return params.DEPLOY_TO_K8S }
+            }
+            steps {
+                script {
+                    def deployImage = params.DOCKERHUB_REPO?.trim()
+                        ? "${params.DOCKERHUB_REPO}:${IMAGE_TAG}"
+                        : "${FULL_IMAGE}"
+                    sh """
+                        cd k8s
+                        kubectl apply -f namespace.yaml
+                        kubectl apply -k .
+                        kubectl -n technova set image deployment/technova-web technova-web=${deployImage} --record || true
+                        kubectl -n technova rollout status deployment/technova-web --timeout=120s
+                    """
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            when {
+                expression { return params.DEPLOY_TO_K8S }
+            }
+            steps {
+                sh '''
+                    echo "Waiting for pods to report Ready..."
+                    kubectl -n technova get pods -o wide
+                    kubectl -n technova get svc technova-web -o wide
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Build ${IMAGE_TAG} (commit ${GIT_SHA}) deployed successfully."
+        }
+        failure {
+            echo "Build failed — check the stage logs above."
+        }
+        always {
+            sh 'docker image prune -f || true'
+        }
+    }
+}
